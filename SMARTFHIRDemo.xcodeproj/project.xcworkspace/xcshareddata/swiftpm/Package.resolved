@@ -1,0 +1,42 @@
+{
+  "originHash" : "ad9bab663d2a05e55e478ca4ffe55cb82059620cc3ecd8557635b400f66f597a",
+  "pins" : [
+    {
+      "identity" : "keychainaccess",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/kishikawakatsumi/KeychainAccess.git",
+      "state" : {
+        "branch" : "master",
+        "revision" : "e0c7eebc5a4465a3c4680764f26b7a61f567cdaf"
+      }
+    },
+    {
+      "identity" : "oauth2",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/p2/OAuth2",
+      "state" : {
+        "revision" : "3f6a18beb221636581e66d8d0cbec1a3948b4df3",
+        "version" : "5.3.5"
+      }
+    },
+    {
+      "identity" : "swift-fhir",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/smart-on-fhir/Swift-FHIR",
+      "state" : {
+        "revision" : "b68fb5d6c8137de4a06894e683dc1a726a832907",
+        "version" : "4.2.1"
+      }
+    },
+    {
+      "identity" : "swift-smart",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/smart-on-fhir/Swift-SMART.git",
+      "state" : {
+        "revision" : "f5d283079e2e5cd12bd0076f05886d19bbd5e125",
+        "version" : "4.2.0"
+      }
+    }
+  ],
+  "version" : 3
+}
