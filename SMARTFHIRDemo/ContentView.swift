@@ -59,7 +59,8 @@ struct ContentView: View {
 
                             HStack(spacing: 16) {
                                 Button("重新選擇病患") {
-//                                  use func reselectPatient()
+                                    // Start a non-destructive patient selection (prefer embedded selector)
+                                    oauthManager.selectPatientNonDestructive(dismiss: nil, forceLogin: false)
                                 }
 
                                 Button("登出") {

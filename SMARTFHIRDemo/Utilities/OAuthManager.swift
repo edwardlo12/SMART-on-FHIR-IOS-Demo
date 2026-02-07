@@ -12,6 +12,11 @@ class OAuthManager: ObservableObject {
     var client: SMART.Client
     private var pendingAuthorizeCompletion: ((Bool, Error?) -> Void)?
 
+    // External auth flags used by beginSelectionFromUI/startPatientSelection logic
+    private var externalAuthLaunched: Bool = false
+    private var lastExternalAuthURL: String?
+    private var isSelectingPatient: Bool = false
+
     init() {
         client = SMART.Client(
             baseURL: URL(string: FHIRConfig.baseURL)!,
@@ -65,7 +70,7 @@ class OAuthManager: ObservableObject {
                 completion(true, nil)
             }
             return
-      }
+        }
 
         print("[DEBUG] No patient provided by authorize callback; patientId not set. Treating as incomplete auth.")
         DispatchQueue.main.async {
@@ -79,9 +84,6 @@ class OAuthManager: ObservableObject {
         // Only handle redirect if SDK is awaiting an auth callback.
         guard client.awaitingAuthCallback else {
             print("[DEBUG] handleRedirect: client is not awaiting auth callback; ignoring redirect")
-            // Clear selecting flag to avoid stuck state if user cancelled flow
-            DispatchQueue.main.async {
-            }
             return
         }
 
@@ -179,11 +181,9 @@ class OAuthManager: ObservableObject {
         }
     }
 
-    // Debug: dump client.server
-
     // MARK: - Token / patient extraction helpers
 
-    private func tryExtractPatientIdFromTokenOrServer() -> String? {
+    func tryExtractPatientIdFromTokenOrServer() -> String? {
         collectTokensFromServerIfNeeded()
         if let token = accessToken, let id = parseJWTForPatientId(token) { return id }
         if let idtok = idToken, let id = parseJWTForPatientId(idtok) { return id }
@@ -262,7 +262,6 @@ class OAuthManager: ObservableObject {
     // MARK: - Logout / reauthorize flows
 
     func logout() {
-        // Try to ask the SDK client to reset/abort if it exposes such API (best-effort)
         attemptClientReset()
 
         collectTokensFromServerIfNeeded()
@@ -295,50 +294,184 @@ class OAuthManager: ObservableObject {
             if let cookies = HTTPCookieStorage.shared.cookies { for cookie in cookies { HTTPCookieStorage.shared.deleteCookie(cookie) } }
             let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
             WKWebsiteDataStore.default().removeData(ofTypes: dataTypes, modifiedSince: Date(timeIntervalSince1970: 0)) { print("[DEBUG] Cleared WKWebsiteDataStore") }
-            // Prefer RP logout if available
             self.doRPInitiatedLogout(idToken: idTokenHint)
         }
     }
 
-    private func attemptClientReset() {
-        // The SMART SDK's Client exposes Swift methods `reset()` and may also support `abort()`.
-        // Call them on the main thread; if the client bridges to NSObject we can call selectors,
-        // otherwise call the Swift API directly.
-        DispatchQueue.main.async {
-            // Fallback: call Swift API if available
-            // reset() exists on SMART.Client; call it to clear internal state
-            self.client.reset()
+    // Start a re-selection flow: clear local selection/tokens and open the patient selection flow.
+    // `dismiss` can be provided to dismiss any currently presented UI before starting selection (e.g. close a detail view).
+    func reselectPatient(dismiss: (() -> Void)? = nil, forceLogin: Bool = false, aggressiveReset: Bool = false) {
+        if !aggressiveReset {
+            if let dismiss = dismiss { DispatchQueue.main.async { dismiss() } }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                print("[DEBUG] reselectPatient: starting non-destructive selection (forceLogin=\(forceLogin))")
+                self.startPatientSelection(forceLogin: forceLogin)
+            }
+            return
         }
-    }
 
-    // MARK: - Token extraction helpers
+        if let dismiss = dismiss { DispatchQueue.main.async { dismiss() } }
+        attemptClientReset()
+        collectTokensFromServerIfNeeded()
 
-    private func extractTokenFromJSONString(_ s: String) -> String? {
-        guard let data = s.data(using: .utf8) else { return nil }
-        if let json = try? JSONSerialization.jsonObject(with: data, options: []), let dict = json as? [String: Any] {
-            if let at = dict["access_token"] as? String { return at }
-            if let it = dict["id_token"] as? String { return it }
-            if let rt = dict["refresh_token"] as? String { return rt }
-            if let tokenResp = dict["tokenResponse"] as? [String: Any] {
-                if let at = tokenResp["access_token"] as? String { return at }
-                if let it = tokenResp["id_token"] as? String { return it }
+        DispatchQueue.main.async {
+            self.isAuthorized = false
+            self.accessToken = nil
+            self.idToken = nil
+            self.patientId = nil
+            KeychainHelper.shared.deleteToken(forKey: "accessToken")
+
+            self.client = SMART.Client(baseURL: URL(string: FHIRConfig.baseURL)!, settings: [
+                "client_id": FHIRConfig.clientId,
+                "redirect": FHIRConfig.redirectURI,
+                "scope": FHIRConfig.scopes
+            ])
+
+            if let cookies = HTTPCookieStorage.shared.cookies {
+                for cookie in cookies { HTTPCookieStorage.shared.deleteCookie(cookie) }
+            }
+            let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
+            WKWebsiteDataStore.default().removeData(ofTypes: dataTypes, modifiedSince: Date(timeIntervalSince1970: 0)) {
+                print("[DEBUG] reselectPatient (aggressive): cleared WKWebsiteDataStore")
             }
         }
-        return nil
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+            print("[DEBUG] reselectPatient (aggressive): beginning fresh selection (forceLogin=\(forceLogin))")
+            self.beginSelectionFromUI(dismiss: nil, forceLogin: forceLogin)
+        }
     }
 
+    private func attemptClientReset() {
+        DispatchQueue.main.async { self.client.reset() }
+    }
 
-    // Start a patient re-selection flow without forcing a full re-login (uses prompt=select_account or embedded SDK flow)
-    func startPatientSelection() {
-        // Non-forced selection: prefer SDK's embedded authorize which may present
-        // a native patient selector without opening the browser.
+    func beginSelectionFromUI(dismiss: (() -> Void)? = nil, forceLogin: Bool = false) {
+        print("[DEBUG] OAuthManager.beginSelectionFromUI: starting selection (forceLogin=\(forceLogin))")
+        if client.awaitingAuthCallback {
+            print("[DEBUG] OAuthManager.beginSelectionFromUI: performing aggressive client reset (forceLogin=\(forceLogin), awaiting=\(self.client.awaitingAuthCallback))")
+            attemptClientReset()
+
+            DispatchQueue.main.async {
+                self.isAuthorized = false
+                self.accessToken = nil
+                self.idToken = nil
+                self.patientId = nil
+            }
+            KeychainHelper.shared.deleteToken(forKey: "accessToken")
+
+            self.client = SMART.Client(baseURL: URL(string: FHIRConfig.baseURL)!, settings: [
+                "client_id": FHIRConfig.clientId,
+                "redirect": FHIRConfig.redirectURI,
+                "scope": FHIRConfig.scopes
+            ])
+
+            if let cookies = HTTPCookieStorage.shared.cookies { for cookie in cookies { HTTPCookieStorage.shared.deleteCookie(cookie) } }
+            let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
+            WKWebsiteDataStore.default().removeData(ofTypes: dataTypes, modifiedSince: Date(timeIntervalSince1970: 0)) { print("[DEBUG] beginSelectionFromUI: cleared WKWebsiteDataStore") }
+
+            self.externalAuthLaunched = false
+            self.lastExternalAuthURL = nil
+            self.isSelectingPatient = false
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+                print("[DEBUG] beginSelectionFromUI: starting fresh selection after aggressive reset")
+                self.startPatientSelection(forceLogin: forceLogin)
+            }
+            return
+        }
+
+        self.startPatientSelection(forceLogin: forceLogin)
+    }
+
+    private func startPatientSelection(forceLogin: Bool = false) {
+        if isSelectingPatient || client.awaitingAuthCallback {
+            print("[DEBUG] startPatientSelection: selection already in progress, ignoring request")
+            return
+        }
+
+        if forceLogin {
+            if let authSettings = tryGetAuthSettings(), let authorizeUri = authSettings["authorize_uri"] as? String {
+                if var comps = URLComponents(string: authorizeUri) {
+                    var queryItems = comps.queryItems ?? []
+                    queryItems.append(URLQueryItem(name: "response_type", value: "code"))
+                    queryItems.append(URLQueryItem(name: "client_id", value: FHIRConfig.clientId))
+                    queryItems.append(URLQueryItem(name: "redirect_uri", value: FHIRConfig.redirectURI))
+                    queryItems.append(URLQueryItem(name: "scope", value: FHIRConfig.scopes))
+                    queryItems.append(URLQueryItem(name: "prompt", value: "login"))
+                    comps.queryItems = queryItems
+                    if let url = comps.url {
+                        let urlStr = url.absoluteString
+                        if externalAuthLaunched && lastExternalAuthURL == urlStr {
+                            print("[DEBUG] startPatientSelection: external auth already launched for same URL, skipping reopen")
+                        } else {
+                            lastExternalAuthURL = urlStr
+                            externalAuthLaunched = true
+                            DispatchQueue.main.async { self.isSelectingPatient = true }
+                            DispatchQueue.main.async { UIApplication.shared.open(url) }
+                        }
+                        return
+                    }
+                }
+            }
+            print("[DEBUG] startPatientSelection(forceLogin): falling back to SDK authorize()")
+            client.authorize(callback: { [weak self] patient, error in
+                self?.handleAuthorizeCallback(patient: patient, error: error)
+            })
+            return
+        }
+
         print("[DEBUG] startPatientSelection: invoking SDK client.authorize() as primary path")
         client.authorize(callback: { [weak self] patient, error in
             self?.handleAuthorizeCallback(patient: patient, error: error)
         })
     }
 
-    // Try to read auth.settings from client.server via Mirror (returns settings dictionary if found)
+    // Non-destructive selection helper: start SDK authorize flow without clearing tokens or resetting client
+    func selectPatientNonDestructive(dismiss: (() -> Void)? = nil, forceLogin: Bool = false) {
+        if let dismiss = dismiss { DispatchQueue.main.async { dismiss() } }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            print("[DEBUG] selectPatientNonDestructive: invoking SDK authorize (forceLogin=\(forceLogin))")
+
+            // Call the SDK authorize path which may present an embedded patient selector.
+            self.client.authorize(callback: { [weak self] patient, error in
+                guard let self = self else { return }
+
+                if let error = error {
+                    print("[DEBUG] selectPatientNonDestructive: authorize returned error: \(error)")
+                    DispatchQueue.main.async { self.isAuthorized = false }
+                    return
+                }
+
+                if let patient = patient {
+                    DispatchQueue.main.async {
+                        self.isAuthorized = true
+                        self.patientId = patient.id?.string
+                        print("[DEBUG] selectPatientNonDestructive: selected patient id=\(self.patientId ?? "nil")")
+                    }
+                    return
+                }
+
+                // Fallback: inspect client.server / tokens
+                self.collectTokensFromServerIfNeeded()
+                if let extracted = self.tryExtractPatientIdFromTokenOrServer() {
+                    DispatchQueue.main.async {
+                        self.isAuthorized = true
+                        self.patientId = extracted
+                        print("[DEBUG] selectPatientNonDestructive: extracted patient id=\(extracted)")
+                    }
+                    return
+                }
+
+                DispatchQueue.main.async {
+                    self.isAuthorized = false
+                    self.patientId = nil
+                }
+            })
+        }
+    }
+
     private func tryGetAuthSettings() -> [String: Any]? {
         let mirror = Mirror(reflecting: client.server)
         for child in mirror.children {
@@ -355,7 +488,6 @@ class OAuthManager: ObservableObject {
                     }
                 }
             }
-            // also check top-level authSettings
             if child.label == "authSettings", let dict = child.value as? [String: Any] {
                 return dict
             }
@@ -363,20 +495,17 @@ class OAuthManager: ObservableObject {
         return nil
     }
 
-    // Heuristic scan to collect access/id tokens from client.server into our published properties.
-    private func collectTokensFromServerIfNeeded() {
+    func collectTokensFromServerIfNeeded() {
         if accessToken != nil || idToken != nil { return }
         let mirror = Mirror(reflecting: client.server)
 
         func inspectString(_ s: String) -> Bool {
-            // try JSON extraction first
             if let token = extractTokenFromJSONString(s) {
                 if isLikelyJWT(token) || token.count > 100 {
                     if accessToken == nil { accessToken = token } else if idToken == nil { idToken = token }
                     return true
                 }
             }
-            // try to find a JWT inside
             if let jwt = findJWTInString(s), isLikelyJWT(jwt) {
                 if accessToken == nil { accessToken = jwt } else if idToken == nil { idToken = jwt }
                 return true
@@ -384,7 +513,6 @@ class OAuthManager: ObservableObject {
             return false
         }
 
-        // shallow traversal
         for child in mirror.children {
             if let label = child.label?.lowercased(), let s = child.value as? String {
                 if label.contains("access") && label.contains("token") {
@@ -402,57 +530,18 @@ class OAuthManager: ObservableObject {
         }
     }
 
-    // UI helper: dismiss UI (if provided) then start selection after a short delay
-    func beginSelectionFromUI(dismiss: (() -> Void)? = nil, forceLogin: Bool = false) {
-        // If a dismiss closure is provided, execute it on main thread to close detail view
-        if let dismiss = dismiss {
-            DispatchQueue.main.async { dismiss() }
-        }
-        // Start selection after a small delay so navigation/dismiss completes
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { [weak self] in
-            guard let self = self else { return }
-            print("[DEBUG] OAuthManager.beginSelectionFromUI: starting selection (forceLogin=\(forceLogin))")
-
-            // If the SDK client still thinks it's awaiting a callback, or caller asked
-            // to force a login, perform an aggressive reset/recreate of the client state
-            // to guarantee a fresh authorization flow.
-            if self.client.awaitingAuthCallback || forceLogin {
-                print("[DEBUG] OAuthManager.beginSelectionFromUI: performing aggressive client reset (forceLogin=\(forceLogin), awaiting=\(self.client.awaitingAuthCallback))")
-
-                // Best-effort: attempt SDK abort/reset first
-                self.attemptClientReset()
-
-                // Clear local token state and Keychain
-                DispatchQueue.main.async {
-                    self.isAuthorized = false
-                    self.accessToken = nil
-                    self.idToken = nil
-                    self.patientId = nil
-                }
-                KeychainHelper.shared.deleteToken(forKey: "accessToken")
-
-                // Recreate client instance to ensure no stale internal state
-                self.client = SMART.Client(baseURL: URL(string: FHIRConfig.baseURL)!, settings: [
-                    "client_id": FHIRConfig.clientId,
-                    "redirect": FHIRConfig.redirectURI,
-                    "scope": FHIRConfig.scopes
-                ])
-
-                // Clear cookies and website data (best-effort)
-                if let cookies = HTTPCookieStorage.shared.cookies {
-                    for cookie in cookies { HTTPCookieStorage.shared.deleteCookie(cookie) }
-                }
-                let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
-                WKWebsiteDataStore.default().removeData(ofTypes: dataTypes, modifiedSince: Date(timeIntervalSince1970: 0)) {
-                    print("[DEBUG] beginSelectionFromUI: cleared WKWebsiteDataStore")
-                }
-
-                return
+    private func extractTokenFromJSONString(_ s: String) -> String? {
+        guard let data = s.data(using: .utf8) else { return nil }
+        if let json = try? JSONSerialization.jsonObject(with: data, options: []), let dict = json as? [String: Any] {
+            if let at = dict["access_token"] as? String { return at }
+            if let it = dict["id_token"] as? String { return it }
+            if let rt = dict["refresh_token"] as? String { return rt }
+            if let tokenResp = dict["tokenResponse"] as? [String: Any] {
+                if let at = tokenResp["access_token"] as? String { return at }
+                if let it = tokenResp["id_token"] as? String { return it }
             }
-
-            // Normal path: start selection
-            self.startPatientSelection()
         }
+        return nil
     }
 
 }

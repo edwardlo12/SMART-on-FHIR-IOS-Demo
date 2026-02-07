@@ -7,7 +7,7 @@ struct PatientDetailView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var oauthManager: OAuthManager
     @EnvironmentObject private var patientViewModel: PatientViewModel
-    
+
     var body: some View {
         GeometryReader { geometry in
             // Use a ScrollView so content can expand on small screens
@@ -25,8 +25,6 @@ struct PatientDetailView: View {
                 // Make the VStack at least as tall as the available space so
                 // Spacer() can push content to the top and the card fills the view.
                 .frame(maxWidth: .infinity, minHeight: geometry.size.height, alignment: .topLeading)
-//                .background(Color(UIColor.systemGray6))
-//                .cornerRadius(12)
                 .padding() // outer padding to the scroll view
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -37,16 +35,14 @@ struct PatientDetailView: View {
         .toolbar {
             ToolbarItem(placement: .navigationBarLeading) {
                 Button(action: {
-                    // Dismiss first to avoid navigation race where clearing state
-                    // while the view is still presented causes a blank/unresponsive view.
+                    // Call the optional onBack if provided; otherwise dismiss the view.
                     if let onBack = onBack {
                         onBack()
                     } else {
                         dismiss()
                     }
-                    
+
                     // After a short delay (allow dismiss animation to complete), clear state
-                    // and allow the main view to show reselect/logout UI.
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
                         print("[DEBUG] PatientDetailView: back action clearing patient and patientId")
                         patientViewModel.patient = nil
@@ -59,25 +55,30 @@ struct PatientDetailView: View {
                     }
                 }
             }
-            // Provide an explicit action to change the selected patient.
+
             ToolbarItem(placement: .navigationBarTrailing) {
                 Button("重新選病患") {
-//                    use func reselectPatient()
+                    // Dismiss the detail, clear local state, and begin non-destructive patient re-selection
+                    oauthManager.selectPatientNonDestructive(dismiss: {
+                        dismiss()
+                        patientViewModel.patient = nil
+                        patientViewModel.error = nil
+                    }, forceLogin: false)
                 }
-             }
-         }
-     }
- }
- 
- #Preview {
-    NavigationStack {
-        PatientDetailView(patient: PatientModel(
-            id: "12345",
-            name: "王小明",
-            birthDate: "1990-01-01",
-            gender: "male"
-        ))
-        .environmentObject(OAuthManager())
-        .environmentObject(PatientViewModel(mockPatient: PatientModel(id: "12345", name: "王小明", birthDate: "1990-01-01", gender: "male")))
+            }
+        }
     }
+}
+
+#Preview {
+   NavigationStack {
+       PatientDetailView(patient: PatientModel(
+           id: "12345",
+           name: "王小明",
+           birthDate: "1990-01-01",
+           gender: "male"
+       ))
+       .environmentObject(OAuthManager())
+       .environmentObject(PatientViewModel(mockPatient: PatientModel(id: "12345", name: "王小明", birthDate: "1990-01-01", gender: "male")))
+   }
 }
