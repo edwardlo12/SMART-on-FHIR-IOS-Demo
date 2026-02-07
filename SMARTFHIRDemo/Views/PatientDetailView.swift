@@ -19,7 +19,6 @@ struct PatientDetailView: View {
                     Text("生日: \(patient.birthDate)")
                     Text("性別: \(patient.gender)")
                     Text("ID: \(patient.id)")
-                    Text("JSON: \(String(describing: patient))")
                     Spacer(minLength: 0)
                 }
                 .padding()
@@ -38,42 +37,39 @@ struct PatientDetailView: View {
         .toolbar {
             ToolbarItem(placement: .navigationBarLeading) {
                 Button(action: {
-                    // Clear loaded patient so ContentView won't immediately
-                    // auto-navigate back to this detail view after dismiss.
-                    patientViewModel.patient = nil
-                    patientViewModel.error = nil
-                    oauthManager.patientId = nil
-
+                    // Dismiss first to avoid navigation race where clearing state
+                    // while the view is still presented causes a blank/unresponsive view.
                     if let onBack = onBack {
                         onBack()
                     } else {
                         dismiss()
                     }
+                    
+                    // After a short delay (allow dismiss animation to complete), clear state
+                    // and allow the main view to show reselect/logout UI.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
+                        print("[DEBUG] PatientDetailView: back action clearing patient and patientId")
+                        patientViewModel.patient = nil
+                        patientViewModel.error = nil
+                        oauthManager.patientId = nil
+                    }
                 }) {
                     HStack(spacing: 6) {
                         Image(systemName: "chevron.left")
-                        Text("返回")
                     }
                 }
             }
             // Provide an explicit action to change the selected patient.
             ToolbarItem(placement: .navigationBarTrailing) {
                 Button("重新選病患") {
-                    // Clear the loaded patient and trigger reauthorization so the
-                    // user can re-select a patient.
-                    patientViewModel.patient = nil
-                    patientViewModel.error = nil
-                    oauthManager.patientId = nil
-                    // Force IdP to prompt login/selection (prompt=login)
-                    oauthManager.forceReauthorize()
-                    dismiss()
+//                    use func reselectPatient()
                 }
-            }
-        }
-    }
-}
-
-#Preview {
+             }
+         }
+     }
+ }
+ 
+ #Preview {
     NavigationStack {
         PatientDetailView(patient: PatientModel(
             id: "12345",

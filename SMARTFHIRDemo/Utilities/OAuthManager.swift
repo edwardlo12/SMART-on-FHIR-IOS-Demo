@@ -48,10 +48,6 @@ class OAuthManager: ObservableObject {
                 self.isAuthorized = true
                 self.patientId = patient.id?.string
                 print("[DEBUG] Set patientId from authorize: \(self.patientId ?? "nil")")
-                print("[DEBUG] client.server raw: \(String(describing: self.client.server))")
-                self.debugPrintServerContents()
-                self.collectTokensFromServerIfNeeded()
-                print("[DEBUG] collected accessToken: \(self.accessToken ?? "(nil)") idToken: \(self.idToken ?? "(nil)")")
                 completion(true, nil)
             }
             return
@@ -59,7 +55,6 @@ class OAuthManager: ObservableObject {
 
         // Fallback: try to extract patient id from tokens/server
         print("[DEBUG] client.server raw: \(String(describing: self.client.server))")
-        self.debugPrintServerContents()
         self.collectTokensFromServerIfNeeded()
         print("[DEBUG] collected accessToken: \(self.accessToken ?? "(nil)") idToken: \(self.idToken ?? "(nil)")")
         if let extracted = tryExtractPatientIdFromTokenOrServer() {
@@ -70,7 +65,7 @@ class OAuthManager: ObservableObject {
                 completion(true, nil)
             }
             return
-        }
+      }
 
         print("[DEBUG] No patient provided by authorize callback; patientId not set. Treating as incomplete auth.")
         DispatchQueue.main.async {
@@ -81,16 +76,25 @@ class OAuthManager: ObservableObject {
     }
 
     func handleRedirect(url: URL) {
-        if client.awaitingAuthCallback {
-            _ = client.didRedirect(to: url)
-            print("[DEBUG] client.server properties: ", Mirror(reflecting: self.client.server))
-            debugPrintServerContents()
-            if let extracted = tryExtractPatientIdFromTokenOrServer() {
-                DispatchQueue.main.async {
-                    self.isAuthorized = true
-                    self.patientId = extracted
-                    print("[DEBUG] Extracted patientId after redirect: \(extracted)")
-                }
+        // Only handle redirect if SDK is awaiting an auth callback.
+        guard client.awaitingAuthCallback else {
+            print("[DEBUG] handleRedirect: client is not awaiting auth callback; ignoring redirect")
+            // Clear selecting flag to avoid stuck state if user cancelled flow
+            DispatchQueue.main.async {
+            }
+            return
+        }
+
+        // Let the SDK process the redirect URL
+        let handled = client.didRedirect(to: url)
+        print("[DEBUG] handleRedirect: client.didRedirect returned \(handled)")
+
+        // Try to extract patient id or tokens from the SDK server state
+        if let extracted = tryExtractPatientIdFromTokenOrServer() {
+            DispatchQueue.main.async {
+                self.isAuthorized = true
+                self.patientId = extracted
+                print("[DEBUG] Extracted patientId after redirect: \(extracted)")
             }
         }
     }
@@ -173,42 +177,9 @@ class OAuthManager: ObservableObject {
             callLogoutURL(urlStr)
             return
         }
-
-        if let discovery = FHIRConfig.discoveryURL {
-            fetchDiscovery { dict in
-                if let dict = dict, let end = dict["end_session_endpoint"] as? String, let post = FHIRConfig.postLogoutRedirect {
-                    let urlStr = "\(end)?id_token_hint=\(idToken ?? "")&post_logout_redirect_uri=\(post)"
-                    callLogoutURL(urlStr)
-                }
-            }
-        }
     }
 
     // Debug: dump client.server
-    func debugPrintServerContents(maxDepth: Int = 4) {
-        func truncated(_ s: String, limit: Int = 200) -> String {
-            if s.count <= limit { return s }
-            let idx = s.index(s.startIndex, offsetBy: limit)
-            return String(s[..<idx]) + "..."
-        }
-        func dumpMirror(_ mirror: Mirror, path: String = "server", depth: Int = 0) {
-            if depth > maxDepth { return }
-            for child in mirror.children {
-                let label = child.label ?? "<anon>"
-                let value = child.value
-                let typeName = String(describing: type(of: value))
-                let desc = truncated(String(describing: value))
-                print("[DEBUG] \(String(repeating: "  ", count: depth))\(path).\(label) : \(typeName) = \(desc)")
-                let childMirror = Mirror(reflecting: value)
-                if !childMirror.children.isEmpty {
-                    dumpMirror(childMirror, path: "\(path).\(label)", depth: depth + 1)
-                }
-            }
-        }
-        print("[DEBUG] ---- BEGIN client.server dump ----")
-        dumpMirror(Mirror(reflecting: self.client.server), path: "client.server", depth: 0)
-        print("[DEBUG] ---- END client.server dump ----")
-    }
 
     // MARK: - Token / patient extraction helpers
 
@@ -291,6 +262,9 @@ class OAuthManager: ObservableObject {
     // MARK: - Logout / reauthorize flows
 
     func logout() {
+        // Try to ask the SDK client to reset/abort if it exposes such API (best-effort)
+        attemptClientReset()
+
         collectTokensFromServerIfNeeded()
         let group = DispatchGroup()
         var didRevoke = false
@@ -326,66 +300,18 @@ class OAuthManager: ObservableObject {
         }
     }
 
-    func forceReauthorize() {
-        if let authSettings = tryGetAuthSettings(), let authorizeUri = authSettings["authorize_uri"] as? String {
-            var comps = URLComponents(string: authorizeUri)
-            var queryItems = [URLQueryItem]()
-            queryItems.append(URLQueryItem(name: "response_type", value: "code"))
-            queryItems.append(URLQueryItem(name: "client_id", value: FHIRConfig.clientId))
-            queryItems.append(URLQueryItem(name: "redirect_uri", value: FHIRConfig.redirectURI))
-            queryItems.append(URLQueryItem(name: "scope", value: FHIRConfig.scopes))
-            queryItems.append(URLQueryItem(name: "prompt", value: "login"))
-            // Copy to a local mutable var to avoid overlapping access errors
-            if var mutableComps = comps {
-                let existing = mutableComps.queryItems ?? []
-                mutableComps.queryItems = existing + queryItems
-                if let url = mutableComps.url { UIApplication.shared.open(url); return }
-            }
+    private func attemptClientReset() {
+        // The SMART SDK's Client exposes Swift methods `reset()` and may also support `abort()`.
+        // Call them on the main thread; if the client bridges to NSObject we can call selectors,
+        // otherwise call the Swift API directly.
+        DispatchQueue.main.async {
+            // Fallback: call Swift API if available
+            // reset() exists on SMART.Client; call it to clear internal state
+            self.client.reset()
         }
-        // fallback
-        authorize { _, error in if let e = error { print("[DEBUG] client.authorize error: \(e)") } }
     }
 
-    private func tryGetAuthSettings() -> [String: Any]? {
-        let mirror = Mirror(reflecting: client.server)
-        for child in mirror.children {
-            if child.label == "auth" {
-                let authMirror = Mirror(reflecting: child.value)
-                for aChild in authMirror.children {
-                    if aChild.label == "some" {
-                        let someMirror = Mirror(reflecting: aChild.value)
-                        for sm in someMirror.children {
-                            if sm.label == "settings", let dict = sm.value as? [String: Any] { return dict }
-                        }
-                    }
-                }
-            }
-        }
-        return nil
-    }
-
-    private func collectTokensFromServerIfNeeded() {
-        if accessToken != nil || idToken != nil { return }
-        let mirror = Mirror(reflecting: client.server)
-        func inspectString(_ s: String) -> Bool {
-            if let token = extractTokenFromJSONString(s) {
-                if isLikelyJWT(token) || token.count > 100 { if accessToken == nil { accessToken = token } else if idToken == nil { idToken = token }; return true }
-            }
-            if let jwt = findJWTInString(s), isLikelyJWT(jwt) { if accessToken == nil { accessToken = jwt } else if idToken == nil { idToken = jwt }; return true }
-            return false
-        }
-        for child in mirror.children {
-            if let label = child.label?.lowercased(), let s = child.value as? String {
-                if label.contains("access") && label.contains("token") { if isLikelyJWT(s) || s.count > 100 { accessToken = s } }
-                else if label.contains("id") && label.contains("token") { if isLikelyJWT(s) || s.count > 100 { idToken = s } }
-                else { _ = inspectString(s) }
-            } else {
-                let desc = String(describing: child.value)
-                _ = inspectString(desc)
-            }
-            if accessToken != nil && idToken != nil { break }
-        }
-    }
+    // MARK: - Token extraction helpers
 
     private func extractTokenFromJSONString(_ s: String) -> String? {
         guard let data = s.data(using: .utf8) else { return nil }
@@ -400,4 +326,133 @@ class OAuthManager: ObservableObject {
         }
         return nil
     }
+
+
+    // Start a patient re-selection flow without forcing a full re-login (uses prompt=select_account or embedded SDK flow)
+    func startPatientSelection() {
+        // Non-forced selection: prefer SDK's embedded authorize which may present
+        // a native patient selector without opening the browser.
+        print("[DEBUG] startPatientSelection: invoking SDK client.authorize() as primary path")
+        client.authorize(callback: { [weak self] patient, error in
+            self?.handleAuthorizeCallback(patient: patient, error: error)
+        })
+    }
+
+    // Try to read auth.settings from client.server via Mirror (returns settings dictionary if found)
+    private func tryGetAuthSettings() -> [String: Any]? {
+        let mirror = Mirror(reflecting: client.server)
+        for child in mirror.children {
+            if child.label == "auth" {
+                let authMirror = Mirror(reflecting: child.value)
+                for aChild in authMirror.children {
+                    if aChild.label == "some" {
+                        let someMirror = Mirror(reflecting: aChild.value)
+                        for sm in someMirror.children {
+                            if sm.label == "settings", let dict = sm.value as? [String: Any] {
+                                return dict
+                            }
+                        }
+                    }
+                }
+            }
+            // also check top-level authSettings
+            if child.label == "authSettings", let dict = child.value as? [String: Any] {
+                return dict
+            }
+        }
+        return nil
+    }
+
+    // Heuristic scan to collect access/id tokens from client.server into our published properties.
+    private func collectTokensFromServerIfNeeded() {
+        if accessToken != nil || idToken != nil { return }
+        let mirror = Mirror(reflecting: client.server)
+
+        func inspectString(_ s: String) -> Bool {
+            // try JSON extraction first
+            if let token = extractTokenFromJSONString(s) {
+                if isLikelyJWT(token) || token.count > 100 {
+                    if accessToken == nil { accessToken = token } else if idToken == nil { idToken = token }
+                    return true
+                }
+            }
+            // try to find a JWT inside
+            if let jwt = findJWTInString(s), isLikelyJWT(jwt) {
+                if accessToken == nil { accessToken = jwt } else if idToken == nil { idToken = jwt }
+                return true
+            }
+            return false
+        }
+
+        // shallow traversal
+        for child in mirror.children {
+            if let label = child.label?.lowercased(), let s = child.value as? String {
+                if label.contains("access") && label.contains("token") {
+                    if isLikelyJWT(s) || s.count > 100 { accessToken = s }
+                } else if label.contains("id") && label.contains("token") {
+                    if isLikelyJWT(s) || s.count > 100 { idToken = s }
+                } else {
+                    _ = inspectString(s)
+                }
+            } else {
+                let desc = String(describing: child.value)
+                _ = inspectString(desc)
+            }
+            if accessToken != nil && idToken != nil { break }
+        }
+    }
+
+    // UI helper: dismiss UI (if provided) then start selection after a short delay
+    func beginSelectionFromUI(dismiss: (() -> Void)? = nil, forceLogin: Bool = false) {
+        // If a dismiss closure is provided, execute it on main thread to close detail view
+        if let dismiss = dismiss {
+            DispatchQueue.main.async { dismiss() }
+        }
+        // Start selection after a small delay so navigation/dismiss completes
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { [weak self] in
+            guard let self = self else { return }
+            print("[DEBUG] OAuthManager.beginSelectionFromUI: starting selection (forceLogin=\(forceLogin))")
+
+            // If the SDK client still thinks it's awaiting a callback, or caller asked
+            // to force a login, perform an aggressive reset/recreate of the client state
+            // to guarantee a fresh authorization flow.
+            if self.client.awaitingAuthCallback || forceLogin {
+                print("[DEBUG] OAuthManager.beginSelectionFromUI: performing aggressive client reset (forceLogin=\(forceLogin), awaiting=\(self.client.awaitingAuthCallback))")
+
+                // Best-effort: attempt SDK abort/reset first
+                self.attemptClientReset()
+
+                // Clear local token state and Keychain
+                DispatchQueue.main.async {
+                    self.isAuthorized = false
+                    self.accessToken = nil
+                    self.idToken = nil
+                    self.patientId = nil
+                }
+                KeychainHelper.shared.deleteToken(forKey: "accessToken")
+
+                // Recreate client instance to ensure no stale internal state
+                self.client = SMART.Client(baseURL: URL(string: FHIRConfig.baseURL)!, settings: [
+                    "client_id": FHIRConfig.clientId,
+                    "redirect": FHIRConfig.redirectURI,
+                    "scope": FHIRConfig.scopes
+                ])
+
+                // Clear cookies and website data (best-effort)
+                if let cookies = HTTPCookieStorage.shared.cookies {
+                    for cookie in cookies { HTTPCookieStorage.shared.deleteCookie(cookie) }
+                }
+                let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
+                WKWebsiteDataStore.default().removeData(ofTypes: dataTypes, modifiedSince: Date(timeIntervalSince1970: 0)) {
+                    print("[DEBUG] beginSelectionFromUI: cleared WKWebsiteDataStore")
+                }
+
+                return
+            }
+
+            // Normal path: start selection
+            self.startPatientSelection()
+        }
+    }
+
 }

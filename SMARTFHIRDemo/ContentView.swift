@@ -59,8 +59,7 @@ struct ContentView: View {
 
                             HStack(spacing: 16) {
                                 Button("重新選擇病患") {
-                                    // Force the IdP to show the login / patient selection UI
-                                    oauthManager.forceReauthorize()
+//                                  use func reselectPatient()
                                 }
 
                                 Button("登出") {
@@ -75,21 +74,7 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity)
                     }
 
-                    if let patient = patientViewModel.patient {
-                        // If patient loaded, show a summary and trigger navigation
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("病患：\(patient.name)")
-                                .font(.headline)
-                            Text("生日：\(patient.birthDate)")
-                                .font(.subheadline)
-                        }
-                        .onAppear {
-                            // Auto-navigate when the patient appears
-                            DispatchQueue.main.async {
-                                self.navigateToDetail = true
-                            }
-                        }
-                    } else if let error = patientViewModel.error {
+                    if let error = patientViewModel.error {
                         Text("資料載入失敗: \(error.localizedDescription)")
                             .foregroundColor(.red)
                     }

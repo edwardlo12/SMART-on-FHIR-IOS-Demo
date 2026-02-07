@@ -20,9 +20,4 @@ struct SMARTFHIRDemoApp: App {
                 }
         }
     }
-    // 處理 URL callback (legacy; kept for reference)
-    func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey : Any] = [:]) -> Bool {
-        oauthManager.handleRedirect(url: url)
-        return true
-    }
 }
